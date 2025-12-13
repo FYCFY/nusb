@@ -526,6 +526,30 @@ impl WindowsInterface {
         }
         state.endpoints.set(address);
 
+        // Align AOSP fastboot usb_windows.cpp behavior:
+        // - Read pipe: timeout=0 (infinite)
+        // - Write pipe: timeout=5000ms
+        unsafe {
+            const PIPE_TRANSFER_TIMEOUT: u32 = 3;
+            let timeout_ms: u32 = match Direction::from_address(address) {
+                Direction::In => 0,
+                Direction::Out => 5000,
+            };
+            let r = WinUsb_SetPipePolicy(
+                self.winusb_handle,
+                address,
+                PIPE_TRANSFER_TIMEOUT,
+                size_of_val(&timeout_ms) as u32,
+                &timeout_ms as *const _ as *const c_void,
+            );
+            if r != TRUE {
+                let err = GetLastError();
+                warn!(
+                    "Failed to set PIPE_TRANSFER_TIMEOUT on endpoint {address:02X}: error {err:x}"
+                );
+            }
+        }
+
         if Direction::from_address(address) == Direction::In {
             unsafe {
                 let enable: u8 = 1;
