@@ -556,24 +556,33 @@ impl MacEndpoint {
         let transfer = transfer.pre_submit();
         let ptr = transfer.as_ptr();
 
+        // Align AOSP fastboot usb_osx.cpp semantics: when host timeout is 0 (blocking),
+        // the underlying USB pipe I/O should not have a ~30s transaction timeout.
+        // IOKit async pipe APIs without explicit TO can return kIOUSBTransactionTimeout.
+        // Use the TO variants with an effectively-infinite timeout.
+        const INFINITE_TIMEOUT_MS: u32 = u32::MAX;
         let res = unsafe {
             match dir {
                 Direction::Out => call_iokit_function!(
                     self.inner.interface.interface.raw,
-                    WritePipeAsync(
+                    WritePipeAsyncTO(
                         self.inner.pipe_ref,
                         buf_ptr as *mut c_void,
                         req_len,
+                        INFINITE_TIMEOUT_MS,
+                        INFINITE_TIMEOUT_MS,
                         transfer_callback,
                         ptr as *mut c_void
                     )
                 ),
                 Direction::In => call_iokit_function!(
                     self.inner.interface.interface.raw,
-                    ReadPipeAsync(
+                    ReadPipeAsyncTO(
                         self.inner.pipe_ref,
                         buf_ptr as *mut c_void,
                         req_len,
+                        INFINITE_TIMEOUT_MS,
+                        INFINITE_TIMEOUT_MS,
                         transfer_callback,
                         ptr as *mut c_void
                     )
