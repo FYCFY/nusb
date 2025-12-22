@@ -550,23 +550,6 @@ impl WindowsInterface {
             }
         }
 
-        if Direction::from_address(address) == Direction::In {
-            unsafe {
-                let enable: u8 = 1;
-                let r = WinUsb_SetPipePolicy(
-                    self.winusb_handle,
-                    address,
-                    Usb::RAW_IO,
-                    size_of_val(&enable) as u32,
-                    &enable as *const _ as *const c_void,
-                );
-                if r != TRUE {
-                    let err = GetLastError();
-                    warn!("Failed to enable RAW_IO on endpoint {address:02X}: error {err:x}",);
-                }
-            }
-        }
-
         Ok(WindowsEndpoint {
             inner: Arc::new(EndpointInner {
                 address,
