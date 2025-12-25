@@ -17,9 +17,10 @@ use log::{debug, error, warn};
 use windows_sys::Win32::{
     Devices::Usb::{
         self, WinUsb_ControlTransfer, WinUsb_Free, WinUsb_GetAssociatedInterface,
-        WinUsb_Initialize, WinUsb_ReadPipe, WinUsb_ResetPipe, WinUsb_SetCurrentAlternateSetting,
-        WinUsb_SetPipePolicy, WinUsb_WritePipe, USB_DEVICE_DESCRIPTOR, WINUSB_INTERFACE_HANDLE,
-        WINUSB_SETUP_PACKET,
+        WinUsb_GetDescriptor, WinUsb_Initialize, WinUsb_ReadPipe, WinUsb_ResetPipe,
+        WinUsb_SetCurrentAlternateSetting, WinUsb_SetPipePolicy, WinUsb_WritePipe,
+        USB_CONFIGURATION_DESCRIPTOR_TYPE, USB_DEVICE_DESCRIPTOR,
+        USB_DEVICE_DESCRIPTOR_TYPE, WINUSB_INTERFACE_HANDLE, WINUSB_SETUP_PACKET,
     },
     Foundation::{
         GetLastError, ERROR_BAD_COMMAND, ERROR_DEVICE_NOT_CONNECTED, ERROR_FILE_NOT_FOUND,
@@ -73,39 +74,84 @@ impl WindowsDevice {
         Blocking::new(move || {
             debug!("Creating device for {:?}", instance_id);
 
-            // Look up the device again in case the DeviceInfo is stale. In
-            // particular, don't trust its `port_number` because another device
-            // might now be connected to that port, and we'd get its descriptors
-            // instead.
-            let hub_port = HubPort::by_child_devinst(devinst)?;
-            let connection_info = hub_port.get_info()?;
+            // ========== Try Hub method first (original implementation) ==========
+            let hub_result = HubPort::by_child_devinst(devinst)
+                .and_then(|hub_port| hub_port.get_info().map(|info| (hub_port, info)));
 
-            // Safety: Windows API struct is repr(C), packed, and we're assuming Windows is little-endian
-            let device_descriptor = unsafe {
-                &transmute::<USB_DEVICE_DESCRIPTOR, [u8; DESCRIPTOR_LEN_DEVICE as usize]>(
-                    connection_info.device_desc,
-                )
+            let (device_descriptor, speed, active_config, num_configurations, hub_port_opt) =
+                match hub_result {
+                    Ok((hub_port, connection_info)) => {
+                        // Hub method succeeded, use original logic
+                        debug!("Using Hub IOCTL method to get device descriptor for {:?}", instance_id);
+
+                        // Safety: Windows API struct is repr(C), packed, and we're assuming Windows is little-endian
+                        let device_desc_bytes = unsafe {
+                            &transmute::<USB_DEVICE_DESCRIPTOR, [u8; DESCRIPTOR_LEN_DEVICE as usize]>(
+                                connection_info.device_desc,
+                            )
+                        };
+                        let device_descriptor = DeviceDescriptor::new(device_desc_bytes)
+                            .ok_or_else(|| Error::new(ErrorKind::Other, "invalid device descriptor"))?;
+
+                        (
+                            device_descriptor,
+                            connection_info.speed,
+                            connection_info.active_config,
+                            connection_info.device_desc.bNumConfigurations,
+                            Some(hub_port),
+                        )
+                    }
+                    Err(hub_err) => {
+                        // ========== Hub method failed, use WinUSB fallback (AOSP fastboot approach) ==========
+                        debug!(
+                            "Hub IOCTL method failed for {:?}: {}. Falling back to WinUSB direct method",
+                            instance_id, hub_err
+                        );
+
+                        let (device_desc_bytes, active_cfg) =
+                            get_device_descriptor_via_winusb(devinst, &instance_id)?;
+
+                        let device_descriptor = DeviceDescriptor::new(&device_desc_bytes)
+                            .ok_or_else(|| Error::new(ErrorKind::Other, "invalid device descriptor"))?;
+
+                        let num_configs = device_desc_bytes[17]; // bNumConfigurations
+
+                        debug!(
+                            "WinUSB fallback succeeded for {:?}: VID={:04x} PID={:04x} NumConfigs={}",
+                            instance_id,
+                            u16::from_le_bytes([device_desc_bytes[8], device_desc_bytes[9]]),
+                            u16::from_le_bytes([device_desc_bytes[10], device_desc_bytes[11]]),
+                            num_configs
+                        );
+
+                        (device_descriptor, None, active_cfg, num_configs, None)
+                    }
+                };
+
+            // Get configuration descriptors
+            let config_descriptors = if let Some(hub_port) = hub_port_opt {
+                // Hub method: use Hub IOCTL to get config descriptors
+                (0..num_configurations)
+                    .flat_map(|i| {
+                        let d = hub_port
+                            .get_descriptor(DESCRIPTOR_TYPE_CONFIGURATION, i, 0)
+                            .inspect_err(|e| error!("Failed to read config descriptor {}: {}", i, e))
+                            .ok()?;
+
+                        ConfigurationDescriptor::new(&d).is_some().then_some(d)
+                    })
+                    .collect()
+            } else {
+                // WinUSB fallback: use WinUsb_GetDescriptor to get config descriptors
+                debug!("Using WinUSB method to get configuration descriptors for {:?}", instance_id);
+                get_config_descriptors_via_winusb(devinst, &instance_id, num_configurations)?
             };
-            let device_descriptor = DeviceDescriptor::new(device_descriptor)
-                .ok_or_else(|| Error::new(ErrorKind::Other, "invalid device descriptor"))?;
-
-            let num_configurations = connection_info.device_desc.bNumConfigurations;
-            let config_descriptors = (0..num_configurations)
-                .flat_map(|i| {
-                    let d = hub_port
-                        .get_descriptor(DESCRIPTOR_TYPE_CONFIGURATION, i, 0)
-                        .inspect_err(|e| error!("Failed to read config descriptor {}: {}", i, e))
-                        .ok()?;
-
-                    ConfigurationDescriptor::new(&d).is_some().then_some(d)
-                })
-                .collect();
 
             Ok(Arc::new(WindowsDevice {
                 device_descriptor,
                 config_descriptors,
-                speed: connection_info.speed,
-                active_config: connection_info.active_config,
+                speed,
+                active_config,
                 devinst,
                 handles: Mutex::new(BTreeMap::new()),
             }))
@@ -799,4 +845,234 @@ impl Drop for EndpointInner {
         let mut state = self.interface.state.lock().unwrap();
         state.endpoints.clear(self.address);
     }
+}
+
+// ========== WinUSB Fallback Helper Functions ==========
+// These functions provide an alternative way to get device/config descriptors
+// when Hub IOCTL method fails (e.g., on PCs with broken USB Hub drivers).
+// Inspired by AOSP fastboot's AdbGetUsbDeviceDescriptor implementation.
+
+use std::ffi::OsString;
+
+/// Get device descriptor via WinUSB API (bypassing Hub IOCTL)
+///
+/// This is a fallback for PCs where USB Hub doesn't properly register
+/// GUID_DEVINTERFACE_USB_HUB, causing Hub IOCTL queries to fail.
+///
+/// Principle: Directly open WinUSB device and call WinUsb_GetDescriptor,
+/// same approach as AOSP fastboot's AdbGetUsbDeviceDescriptor.
+fn get_device_descriptor_via_winusb(
+    devinst: DevInst,
+    instance_id: &OsString,
+) -> Result<([u8; DESCRIPTOR_LEN_DEVICE as usize], u8), Error> {
+    debug!("Attempting WinUSB direct descriptor read for {:?}", instance_id);
+
+    // 1. Get device path
+    let device_path = get_winusb_device_path(devinst).or_else(|_| {
+        // If it's a USBCCGP device, try to get the first interface
+        debug!("Trying USBCCGP child interface for {:?}", instance_id);
+        find_usbccgp_child(devinst, 0)
+            .ok_or_else(|| {
+                Error::new(
+                    ErrorKind::NotFound,
+                    "no WinUSB interface found",
+                )
+            })
+            .and_then(|(_, child)| get_usbccgp_winusb_device_path(child))
+    })?;
+
+    debug!("Opening WinUSB device at path: {}", device_path);
+
+    // 2. Open device file handle
+    let device_handle = create_file(&device_path).map_err(|code| {
+        Error::new_os(
+            ErrorKind::Other,
+            "failed to open device for WinUSB descriptor read",
+            code,
+        )
+    })?;
+
+    // 3. Initialize WinUSB handle
+    let winusb_handle = unsafe {
+        let mut h = ptr::null_mut();
+        if WinUsb_Initialize(raw_handle(&device_handle), &mut h) == FALSE {
+            let err = GetLastError();
+            return Err(Error::new_os(
+                ErrorKind::Other,
+                "failed to initialize WinUSB",
+                err,
+            ));
+        }
+        h
+    };
+
+    // 4. Call WinUsb_GetDescriptor to get device descriptor (KEY STEP!)
+    let mut desc_buffer = [0u8; DESCRIPTOR_LEN_DEVICE as usize];
+    let mut bytes_returned = 0u32;
+
+    let result = unsafe {
+        WinUsb_GetDescriptor(
+            winusb_handle,
+            USB_DEVICE_DESCRIPTOR_TYPE as u8, // Device descriptor type
+            0,                           // Index
+            0,                           // Language ID (not used for device descriptor)
+            desc_buffer.as_mut_ptr(),
+            desc_buffer.len() as u32,
+            &mut bytes_returned,
+        )
+    };
+
+    // 5. Free WinUSB handle
+    unsafe {
+        WinUsb_Free(winusb_handle);
+    }
+
+    if result == FALSE {
+        let err = unsafe { GetLastError() };
+        return Err(Error::new_os(
+            ErrorKind::Other,
+            "WinUsb_GetDescriptor failed for device descriptor",
+            err,
+        ));
+    }
+
+    if bytes_returned != DESCRIPTOR_LEN_DEVICE as u32 {
+        debug!(
+            "Incomplete device descriptor for {:?}: got {} bytes, expected {}",
+            instance_id, bytes_returned, DESCRIPTOR_LEN_DEVICE
+        );
+        return Err(Error::new(
+            ErrorKind::Other,
+            "incomplete device descriptor",
+        ));
+    }
+
+    // 6. Guess active configuration (usually 1 if device has configs)
+    let num_configs = desc_buffer[17];
+    let active_config = if num_configs > 0 { 1 } else { 0 };
+
+    debug!(
+        "Successfully read device descriptor via WinUSB for {:?}: {} bytes",
+        instance_id, bytes_returned
+    );
+
+    Ok((desc_buffer, active_config))
+}
+
+/// Get configuration descriptors via WinUSB API (bypassing Hub IOCTL)
+fn get_config_descriptors_via_winusb(
+    devinst: DevInst,
+    instance_id: &OsString,
+    num_configurations: u8,
+) -> Result<Vec<Vec<u8>>, Error> {
+    if num_configurations == 0 {
+        return Ok(Vec::new());
+    }
+
+    debug!(
+        "Attempting WinUSB config descriptor read for {:?}: {} configs",
+        instance_id, num_configurations
+    );
+
+    // Get device path
+    let device_path = get_winusb_device_path(devinst).or_else(|_| {
+        find_usbccgp_child(devinst, 0)
+            .ok_or_else(|| Error::new(ErrorKind::NotFound, "no WinUSB interface found"))
+            .and_then(|(_, child)| get_usbccgp_winusb_device_path(child))
+    })?;
+
+    let device_handle = create_file(&device_path).map_err(|code| {
+        Error::new_os(
+            ErrorKind::Other,
+            "failed to open device for WinUSB config descriptor read",
+            code,
+        )
+    })?;
+    let winusb_handle = unsafe {
+        let mut h = ptr::null_mut();
+        if WinUsb_Initialize(raw_handle(&device_handle), &mut h) == FALSE {
+            let err = GetLastError();
+            return Err(Error::new_os(
+                ErrorKind::Other,
+                "failed to initialize WinUSB for config descriptors",
+                err,
+            ));
+        }
+        h
+    };
+
+    let mut descriptors = Vec::new();
+
+    for i in 0..num_configurations {
+        // First, get config descriptor header (9 bytes) to read total length
+        let mut temp_buf = [0u8; 9];
+        let mut bytes_returned = 0u32;
+
+        let result = unsafe {
+            WinUsb_GetDescriptor(
+                winusb_handle,
+                USB_CONFIGURATION_DESCRIPTOR_TYPE as u8,
+                i,
+                0,
+                temp_buf.as_mut_ptr(),
+                temp_buf.len() as u32,
+                &mut bytes_returned,
+            )
+        };
+
+        if result == FALSE {
+            debug!(
+                "Failed to read config descriptor {} header for {:?}",
+                i, instance_id
+            );
+            continue;
+        }
+
+        // Parse total length from header (bytes 2-3, little-endian)
+        let total_length = u16::from_le_bytes([temp_buf[2], temp_buf[3]]) as usize;
+
+        // Read full configuration descriptor
+        let mut full_buf = vec![0u8; total_length];
+        let result = unsafe {
+            WinUsb_GetDescriptor(
+                winusb_handle,
+                USB_CONFIGURATION_DESCRIPTOR_TYPE as u8,
+                i,
+                0,
+                full_buf.as_mut_ptr(),
+                full_buf.len() as u32,
+                &mut bytes_returned,
+            )
+        };
+
+        if result != FALSE && bytes_returned as usize == total_length {
+            if ConfigurationDescriptor::new(&full_buf).is_some() {
+                debug!(
+                    "Successfully read config descriptor {} for {:?}: {} bytes",
+                    i, instance_id, bytes_returned
+                );
+                descriptors.push(full_buf);
+            } else {
+                debug!("Invalid config descriptor {} for {:?}", i, instance_id);
+            }
+        } else {
+            debug!(
+                "Failed to read full config descriptor {} for {:?}",
+                i, instance_id
+            );
+        }
+    }
+
+    unsafe {
+        WinUsb_Free(winusb_handle);
+    }
+
+    debug!(
+        "Successfully read {} out of {} config descriptors via WinUSB for {:?}",
+        descriptors.len(),
+        num_configurations,
+        instance_id
+    );
+
+    Ok(descriptors)
 }
