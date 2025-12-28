@@ -861,7 +861,7 @@ use std::ffi::OsString;
 ///
 /// Principle: Directly open WinUSB device and call WinUsb_GetDescriptor,
 /// same approach as AOSP fastboot's AdbGetUsbDeviceDescriptor.
-fn get_device_descriptor_via_winusb(
+pub(crate) fn get_device_descriptor_via_winusb(
     devinst: DevInst,
     instance_id: &OsString,
 ) -> Result<([u8; DESCRIPTOR_LEN_DEVICE as usize], u8), Error> {
@@ -960,7 +960,7 @@ fn get_device_descriptor_via_winusb(
 }
 
 /// Get configuration descriptors via WinUSB API (bypassing Hub IOCTL)
-fn get_config_descriptors_via_winusb(
+pub(crate) fn get_config_descriptors_via_winusb(
     devinst: DevInst,
     instance_id: &OsString,
     num_configurations: u8,

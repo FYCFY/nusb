@@ -7,13 +7,13 @@ use windows_sys::Win32::Devices::{
         DEVPKEY_Device_HardwareIds, DEVPKEY_Device_InstanceId, DEVPKEY_Device_LocationPaths,
         DEVPKEY_Device_Parent, DEVPKEY_Device_Service,
     },
-    Usb::{GUID_DEVINTERFACE_USB_DEVICE, GUID_DEVINTERFACE_USB_HUB},
+    Usb::{USB_DEVICE_DESCRIPTOR, GUID_DEVINTERFACE_USB_DEVICE, GUID_DEVINTERFACE_USB_HUB},
 };
 
 use crate::{
     descriptors::{
         decode_string_descriptor, language_id::US_ENGLISH, ConfigurationDescriptor,
-        DESCRIPTOR_TYPE_CONFIGURATION, DESCRIPTOR_TYPE_STRING,
+        DESCRIPTOR_LEN_DEVICE, DESCRIPTOR_TYPE_CONFIGURATION, DESCRIPTOR_TYPE_STRING,
     },
     maybe_future::{blocking::Blocking, MaybeFuture},
     BusInfo, DeviceInfo, Error, ErrorKind, InterfaceInfo, UsbControllerType,
@@ -21,6 +21,7 @@ use crate::{
 
 use super::{
     cfgmgr32::{self, get_device_interface_property, DevInst},
+    device::{get_config_descriptors_via_winusb, get_device_descriptor_via_winusb},
     hub::HubPort,
     util::WCString,
 };
@@ -63,34 +64,129 @@ pub fn probe_device(devinst: DevInst) -> Option<DeviceInfo> {
     let parent_instance_id = devinst.get_property::<OsString>(DEVPKEY_Device_Parent)?;
     let port_number = devinst.get_property::<u32>(DEVPKEY_Device_Address)?;
 
-    let hub_port = HubPort::by_child_devinst(devinst).ok()?;
-    let info = hub_port.get_info().ok()?;
+    let hub_result = HubPort::by_child_devinst(devinst)
+        .and_then(|hub_port| hub_port.get_info().map(|info| (hub_port, info)));
 
     let product_string = devinst
         .get_property::<OsString>(DEVPKEY_Device_BusReportedDeviceDesc)
         .and_then(|s| s.into_string().ok());
     // DEVPKEY_Device_Manufacturer exists but is often wrong and appears not to be read from the string descriptor but the .inf file
 
-    let serial_number = if info.device_desc.iSerialNumber != 0 {
-        // Experimentally confirmed, the string descriptor is cached and this does
-        // not perform IO. However, the language ID list is not cached, so we
-        // have to assume 0x0409 (which will be right 99% of the time).
-        hub_port
-            .get_descriptor(
-                DESCRIPTOR_TYPE_STRING,
-                info.device_desc.iSerialNumber,
-                US_ENGLISH,
-            )
-            .ok()
-            .and_then(|data| decode_string_descriptor(&data).ok())
-    } else {
-        None
-    };
-
     let driver = get_driver_name(devinst);
 
-    let mut interfaces =
-        list_interfaces_from_desc(&hub_port, info.active_config).unwrap_or_default();
+    let (device_desc_bytes, speed, active_config, device_address, serial_number, mut interfaces) =
+        match hub_result {
+        Ok((hub_port, info)) => {
+            let serial_number = if info.device_desc.iSerialNumber != 0 {
+                // Experimentally confirmed, the string descriptor is cached and this does
+                // not perform IO. However, the language ID list is not cached, so we
+                // have to assume 0x0409 (which will be right 99% of the time).
+                hub_port
+                    .get_descriptor(
+                        DESCRIPTOR_TYPE_STRING,
+                        info.device_desc.iSerialNumber,
+                        US_ENGLISH,
+                    )
+                    .ok()
+                    .and_then(|data| decode_string_descriptor(&data).ok())
+            } else {
+                None
+            };
+
+            let device_desc_bytes = unsafe {
+                &std::mem::transmute::<USB_DEVICE_DESCRIPTOR, [u8; DESCRIPTOR_LEN_DEVICE as usize]>(
+                    info.device_desc,
+                )
+            };
+
+            let interfaces =
+                list_interfaces_from_desc(&hub_port, info.active_config).unwrap_or_default();
+
+            let vid = u16::from_le_bytes([device_desc_bytes[8], device_desc_bytes[9]]);
+            let pid = u16::from_le_bytes([device_desc_bytes[10], device_desc_bytes[11]]);
+            let dev_class = device_desc_bytes[4];
+            let dev_subclass = device_desc_bytes[5];
+            let dev_protocol = device_desc_bytes[6];
+            debug!(
+                "Hub IOCTL probe success for {:?}: VID={:04x} PID={:04x} DevClass={:02x}/{:02x}/{:02x}",
+                instance_id, vid, pid, dev_class, dev_subclass, dev_protocol
+            );
+
+            (
+                *device_desc_bytes,
+                info.speed,
+                info.active_config,
+                info.address,
+                serial_number,
+                interfaces,
+            )
+        }
+        Err(hub_err) => {
+            debug!(
+                "Hub IOCTL method failed for {:?}: {}. Falling back to WinUSB probe",
+                instance_id, hub_err
+            );
+
+            let (device_desc_bytes, active_config) =
+                match get_device_descriptor_via_winusb(devinst, &instance_id) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        debug!(
+                            "WinUSB device descriptor read failed for {:?}: {}",
+                            instance_id, e
+                        );
+                        return None;
+                    }
+                };
+
+            let num_configurations = device_desc_bytes[17];
+            let config_descs = match get_config_descriptors_via_winusb(
+                devinst,
+                &instance_id,
+                num_configurations,
+            ) {
+                Ok(v) => v,
+                Err(e) => {
+                    debug!(
+                        "WinUSB config descriptor read failed for {:?}: {}",
+                        instance_id, e
+                    );
+                    Vec::new()
+                }
+            };
+
+            let interfaces =
+                list_interfaces_from_config_descs(&config_descs, active_config);
+
+            debug!(
+                "WinUSB probe success for {:?}: VID={:04x} PID={:04x} DevClass={:02x}/{:02x}/{:02x}",
+                instance_id,
+                u16::from_le_bytes([device_desc_bytes[8], device_desc_bytes[9]]),
+                u16::from_le_bytes([device_desc_bytes[10], device_desc_bytes[11]]),
+                device_desc_bytes[4],
+                device_desc_bytes[5],
+                device_desc_bytes[6]
+            );
+
+            (device_desc_bytes, None, active_config, 0, None, interfaces)
+        }
+    };
+
+    if !interfaces.is_empty() {
+        let mut summary = String::new();
+        for (idx, intf) in interfaces.iter().enumerate() {
+            if idx > 0 {
+                summary.push_str(", ");
+            }
+            summary.push_str(&format!(
+                "{}:{:02x}/{:02x}/{:02x}",
+                intf.interface_number, intf.class, intf.subclass, intf.protocol
+            ));
+        }
+        debug!("Interface descriptors for {:?}: {}", instance_id, summary);
+    } else {
+        debug!("No interface descriptors for {:?}", instance_id);
+    }
 
     if driver.eq_ignore_ascii_case("usbccgp") {
         // Populate interface descriptor strings when available from child device nodes.
@@ -130,15 +226,15 @@ pub fn probe_device(devinst: DevInst) -> Option<DeviceInfo> {
         port_chain,
         driver: Some(driver).filter(|s| !s.is_empty()),
         bus_id,
-        device_address: info.address,
-        vendor_id: info.device_desc.idVendor,
-        product_id: info.device_desc.idProduct,
-        device_version: info.device_desc.bcdDevice,
-        usb_version: info.device_desc.bcdUSB,
-        class: info.device_desc.bDeviceClass,
-        subclass: info.device_desc.bDeviceSubClass,
-        protocol: info.device_desc.bDeviceProtocol,
-        speed: info.speed,
+        device_address,
+        vendor_id: u16::from_le_bytes([device_desc_bytes[8], device_desc_bytes[9]]),
+        product_id: u16::from_le_bytes([device_desc_bytes[10], device_desc_bytes[11]]),
+        device_version: u16::from_le_bytes([device_desc_bytes[12], device_desc_bytes[13]]),
+        usb_version: u16::from_le_bytes([device_desc_bytes[2], device_desc_bytes[3]]),
+        class: device_desc_bytes[4],
+        subclass: device_desc_bytes[5],
+        protocol: device_desc_bytes[6],
+        speed,
         manufacturer_string: None,
         product_string,
         serial_number,
@@ -219,6 +315,34 @@ fn list_interfaces_from_desc(hub_port: &HubPort, active_config: u8) -> Option<Ve
             })
             .collect(),
     )
+}
+
+fn list_interfaces_from_config_descs(
+    config_descs: &[Vec<u8>],
+    active_config: u8,
+) -> Vec<InterfaceInfo> {
+    for buf in config_descs {
+        let Some(desc) = ConfigurationDescriptor::new(&buf[..]) else {
+            continue;
+        };
+        if desc.configuration_value() != active_config {
+            continue;
+        }
+        return desc
+            .interfaces()
+            .map(|i| {
+                let i_desc = i.first_alt_setting();
+                InterfaceInfo {
+                    interface_number: i.interface_number(),
+                    class: i_desc.class(),
+                    subclass: i_desc.subclass(),
+                    protocol: i_desc.protocol(),
+                    interface_string: None,
+                }
+            })
+            .collect();
+    }
+    Vec::new()
 }
 
 pub(crate) fn get_driver_name(dev: DevInst) -> String {
